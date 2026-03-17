@@ -140,8 +140,6 @@ Certificates are generated automatically on first run. To generate manually:
 
 ```bash
 bash generate-certs.sh <YOUR_VM_IP>
-# Example:
-bash generate-certs.sh 192.168.20.240
 ```
 
 This creates:
