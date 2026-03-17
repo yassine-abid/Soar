@@ -1,0 +1,66 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# SOAR Stack — .gitignore
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ── Private keys — NEVER commit ─────────────────────────────────────────────
+pki/ca/ca.key
+pki/*/server.key
+pki/*/key.pem
+docker/*/certificates/*.key
+docker/*/nginx/certs/*.key
+misp-docker/misp-docker/ssl/key.pem
+Shuffle/frontend/certs/privkey.pem
+
+# ── PKI private keys — NEVER commit ────────────────────────────────────────
+# (Public certs ARE committed so the repo is self-contained)
+pki/ca/ca.key
+pki/*/server.key
+pki/*/key.pem
+pki/ca/*.srl
+
+# ── Environment files — never commit secrets ────────────────────────────────
+.env
+Shuffle/.env.local
+**/secrets/
+
+# Always commit the template
+!.env.example
+
+# ── Cassandra backups (binary runtime data) ─────────────────────────────────
+docker/prod1-thehive/cassandra_backup_*/
+docker/prod2-thehive/cassandra_backup_*/
+
+# ── Docker runtime / data volumes ───────────────────────────────────────────
+.docker/
+*.log
+docker/prod1-cortex/elasticsearch/data/
+docker/prod1-cortex/elasticsearch/logs/
+docker/prod1-cortex/cortex/cortex-jobs/
+docker/prod1-cortex/cortex/logs/
+docker/prod1-thehive/elasticsearch/data/
+docker/prod1-thehive/elasticsearch/logs/
+docker/prod1-thehive/cassandra/data/
+docker/prod1-thehive/cassandra/logs/
+docker/prod1-thehive/thehive/data/files/
+docker/prod1-thehive/thehive/logs/
+Shuffle/shuffle-database/
+Shuffle/shuffle-apps/
+Shuffle/shuffle-files/
+
+# ── MISP runtime data (owned by www-data, not config) ───────────────────────
+misp-docker/misp-docker/configs/
+misp-docker/misp-docker/logs/
+misp-docker/misp-docker/files/
+misp-docker/misp-docker/gnupg/
+
+# ── Backups created by fix/cert scripts ─────────────────────────────────────
+*.bak
+*.bak.*
+
+# ── OS / editor noise ────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo

@@ -1,0 +1,603 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# SOAR Stack — Root Docker Compose
+# ═══════════════════════════════════════════════════════════════════════════════
+# Orchestrates: MISP → Cortex → TheHive → Shuffle
+#
+# Startup order (enforced via depends_on + healthchecks):
+#   thehive-elasticsearch ─┐
+#   cortex-elasticsearch  ─┤
+#   cassandra             ─┤→ misp-core → cortex → thehive → shuffle-backend
+#   misp-db / misp-redis  ─┘
+#
+# Networks:
+#   soar-shared     — cross-stack service discovery (replaces "external: true" in sub-composes)
+#   cortex-network  — internal Cortex stack
+#   thehive-network — internal TheHive stack
+#   shuffle         — internal Shuffle stack
+#   default         — MISP internal (db, redis, mail)
+#
+# Usage:
+#   cp .env.example .env && nano .env
+#   docker compose up -d
+# ═══════════════════════════════════════════════════════════════════════════════
+
+networks:
+  soar-shared:
+    name: soar-shared
+    driver: bridge
+  cortex-network:
+    driver: bridge
+  thehive-network:
+    driver: bridge
+  shuffle:
+    driver: bridge
+
+volumes:
+  mysql_data:
+  cache_data:
+  misp_guard_ca:
+  shuffle-database:
+    driver: local
+    driver_opts:
+      type: none
+      device: ${DB_LOCATION:-./Shuffle/shuffle-database}
+      o: bind
+
+services:
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # MISP — Threat Intelligence Platform
+  # Ports: 80 (HTTP redirect), 443 (HTTPS)
+  # Certs: misp-docker/misp-docker/ssl/ → /etc/nginx/certs/
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  misp-mail:
+    image: ghcr.io/egos-tech/smtp:1.1.3
+    restart: always
+    environment:
+      - "SES_USER=${SES_USER}"
+      - "SES_PASSWORD=${SES_PASSWORD}"
+      - "SES_REGION=${SES_REGION}"
+      - "SES_PORT=${SES_PORT}"
+      - "SMARTHOST_ADDRESS=${SMARTHOST_ADDRESS}"
+      - "SMARTHOST_PORT=${SMARTHOST_PORT}"
+      - "SMARTHOST_USER=${SMARTHOST_USER}"
+      - "SMARTHOST_PASSWORD=${SMARTHOST_PASSWORD}"
+      - "SMARTHOST_ALIASES=${SMARTHOST_ALIASES}"
+    networks:
+      - default
+
+  misp-redis:
+    image: valkey/valkey:7.2
+    restart: always
+    command: |
+      sh -c '
+        if [ "$${ENABLE_REDIS_EMPTY_PASSWORD:-false}" = "true" ]; then
+          exec valkey-server
+        else
+          exec valkey-server --requirepass "$${REDIS_PASSWORD:-redispassword}"
+        fi
+      '
+    environment:
+      - "ENABLE_REDIS_EMPTY_PASSWORD=${ENABLE_REDIS_EMPTY_PASSWORD:-false}"
+      - "REDIS_PASSWORD=${REDIS_PASSWORD:-redispassword}"
+    healthcheck:
+      test: |
+        sh -c '
+          if [ "$${ENABLE_REDIS_EMPTY_PASSWORD:-false}" = "true" ]; then
+            valkey-cli -p $${REDIS_PORT:-6379} ping | grep -q PONG || exit 1
+          else
+            valkey-cli -a "$${REDIS_PASSWORD:-redispassword}" -p $${REDIS_PORT:-6379} ping | grep -q PONG || exit 1
+          fi
+        '
+      interval: 2s
+      timeout: 1s
+      retries: 3
+      start_period: 5s
+      start_interval: 5s
+    volumes:
+      - cache_data:/data:Z
+    networks:
+      - default
+
+  misp-db:
+    image: mariadb:10.11
+    restart: always
+    environment:
+      - "MYSQL_USER=${MYSQL_USER:-misp}"
+      - "MYSQL_PASSWORD=${MYSQL_PASSWORD:-example}"
+      - "MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD:-password}"
+      - "MYSQL_DATABASE=${MYSQL_DATABASE:-misp}"
+    command: >-
+      --innodb-buffer-pool-size=${INNODB_BUFFER_POOL_SIZE:-2048M}
+      --innodb-change-buffering=${INNODB_CHANGE_BUFFERING:-none}
+      --innodb-io-capacity=${INNODB_IO_CAPACITY:-1000}
+      --innodb-io-capacity-max=${INNODB_IO_CAPACITY_MAX:-2000}
+      --innodb-log-file-size=${INNODB_LOG_FILE_SIZE:-600M}
+      --innodb-read-io-threads=${INNODB_READ_IO_THREADS:-16}
+      --innodb-stats-persistent=${INNODB_STATS_PERSISTENT:-ON}
+      --innodb-write-io-threads=${INNODB_WRITE_IO_THREADS:-4}
+    volumes:
+      - mysql_data:/var/lib/mysql:Z
+    cap_add:
+      - SYS_NICE
+    healthcheck:
+      test: mysqladmin --user=$$MYSQL_USER --password=$$MYSQL_PASSWORD status
+      interval: 2s
+      timeout: 1s
+      retries: 3
+      start_period: 30s
+      start_interval: 5s
+    networks:
+      - default
+
+  misp-modules:
+    image: ghcr.io/misp/misp-docker/misp-modules:${MODULES_RUNNING_TAG:-latest}
+    restart: always
+    build:
+      context: ./misp-docker/misp-docker/modules/.
+      args:
+        - MODULES_TAG=${MODULES_TAG:?Missing MODULES_TAG — copy .env.example to .env}
+        - MODULES_COMMIT=${MODULES_COMMIT}
+        - MODULES_FLAVOR=${MODULES_FLAVOR:-standard}
+    healthcheck:
+      test: "/bin/bash -c '</dev/tcp/localhost/6666'"
+      interval: 2s
+      timeout: 1s
+      retries: 3
+      start_period: 5s
+      start_interval: 5s
+    volumes:
+      - ./misp-docker/misp-docker/custom/action_mod/:/custom/action_mod/:Z
+      - ./misp-docker/misp-docker/custom/expansion/:/custom/expansion/:Z
+      - ./misp-docker/misp-docker/custom/export_mod/:/custom/export_mod/:Z
+      - ./misp-docker/misp-docker/custom/import_mod/:/custom/import_mod/:Z
+    networks:
+      - default
+
+  misp-core:
+    image: ghcr.io/misp/misp-docker/misp-core:${CORE_RUNNING_TAG:-latest}
+    restart: always
+    cap_add:
+      - AUDIT_WRITE
+    build:
+      context: ./misp-docker/misp-docker/core/.
+      args:
+        - CORE_TAG=${CORE_TAG:?Missing CORE_TAG — copy .env.example to .env}
+        - CORE_COMMIT=${CORE_COMMIT}
+        - CORE_FLAVOR=${CORE_FLAVOR:-standard}
+        - PHP_VER=${PHP_VER:?Missing PHP_VER — copy .env.example to .env}
+        - PYPI_SETUPTOOLS_VERSION=${PYPI_SETUPTOOLS_VERSION}
+        - PYPI_SUPERVISOR_VERSION=${PYPI_SUPERVISOR_VERSION}
+    depends_on:
+      misp-redis:
+        condition: service_healthy
+      misp-db:
+        condition: service_healthy
+      misp-modules:
+        condition: service_healthy
+    healthcheck:
+      test: curl -ks ${MISP_BASEURL:-https://localhost}/users/heartbeat > /dev/null || exit 1
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    ports:
+      - "${MISP_HTTP_PORT:-80}:80"
+      - "${MISP_HTTPS_PORT:-443}:443"
+    networks:
+      - soar-shared
+      - default
+    volumes:
+      - ./misp-docker/misp-docker/ssl/:/etc/nginx/certs/:Z
+      - misp_guard_ca:/usr/local/share/ca-certificates/misp_guard:Z
+    environment:
+      - "BASE_URL=${MISP_BASEURL}"
+      - "CRON_USER_ID=${CRON_USER_ID}"
+      - "ADMIN_EMAIL=${MISP_ADMIN_EMAIL}"
+      - "ADMIN_PASSWORD=${MISP_ADMIN_PASS}"
+      - "ADMIN_KEY=${ADMIN_KEY}"
+      - "ADMIN_ORG=${ADMIN_ORG}"
+      - "ADMIN_ORG_UUID=${ADMIN_ORG_UUID}"
+      - "GPG_PASSPHRASE=${GPG_PASSPHRASE}"
+      # Internal service names (renamed from originals: db → misp-db, redis → misp-redis)
+      - "MYSQL_HOST=${MYSQL_HOST:-misp-db}"
+      - "MYSQL_PORT=${MYSQL_PORT:-3306}"
+      - "MYSQL_USER=${MYSQL_USER:-misp}"
+      - "MYSQL_PASSWORD=${MYSQL_PASSWORD:-example}"
+      - "MYSQL_DATABASE=${MYSQL_DATABASE:-misp}"
+      - "REDIS_HOST=${REDIS_HOST:-misp-redis}"
+      - "REDIS_PORT=${REDIS_PORT:-6379}"
+      - "REDIS_PASSWORD=${REDIS_PASSWORD:-redispassword}"
+      - "SMTP_FQDN=${SMTP_FQDN:-misp-mail}"
+      - "ENABLE_DB_SETTINGS=${ENABLE_DB_SETTINGS}"
+      - "ENCRYPTION_KEY=${ENCRYPTION_KEY}"
+      - "DISABLE_IPV6=${DISABLE_IPV6}"
+      - "DISABLE_SSL_REDIRECT=${DISABLE_SSL_REDIRECT}"
+      - "NGINX_CLIENT_MAX_BODY_SIZE=${NGINX_CLIENT_MAX_BODY_SIZE:-50M}"
+      - "PHP_MEMORY_LIMIT=${PHP_MEMORY_LIMIT:-2048M}"
+      - "COMPOSE_PROFILES=${COMPOSE_PROFILES:-core}"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # CORTEX — Observable Analysis Engine
+  # Ports: 9001 (API), 8443 (HTTPS via nginx)
+  # Certs: docker/prod1-cortex/nginx/certs/ → /etc/nginx/certs/
+  # Depends on: misp-core (healthy)
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  cortex-elasticsearch:
+    image: "elasticsearch:${ES_IMAGE_VERSION:-7.17.28}"
+    container_name: cortex-elasticsearch
+    hostname: cortex-elasticsearch
+    restart: unless-stopped
+    user: "${SOAR_UID:-1000}:0"
+    depends_on:
+      misp-core:
+        condition: service_healthy
+    environment:
+      - http.host=0.0.0.0
+      - discovery.type=single-node
+      - cluster.name=hive
+      - thread_pool.search.queue_size=100000
+      - thread_pool.write.queue_size=100000
+      - bootstrap.memory_lock=false
+      - xpack.security.enabled=true
+      - "ELASTIC_PASSWORD=${CORTEX_ES_PASSWORD:?Set CORTEX_ES_PASSWORD in .env}"
+      - ES_JAVA_OPTS=-Xms1500m -Xmx1500m
+    volumes:
+      - ./docker/prod1-cortex/elasticsearch/data:/usr/share/elasticsearch/data
+      - ./docker/prod1-cortex/elasticsearch/logs:/usr/share/elasticsearch/logs
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    deploy:
+      resources:
+        limits:
+          memory: 3G
+          cpus: '2.000'
+    memswap_limit: 3G
+    networks:
+      - cortex-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f -s -u 'elastic:${CORTEX_ES_PASSWORD}' http://localhost:9200/_cluster/health?wait_for_status=yellow\\&timeout=50s || exit 1"]
+      start_period: 120s
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    labels:
+      com.strangebee.stack: "cortex-stack"
+      com.strangebee.service: "elasticsearch"
+
+  cortex:
+    image: "thehiveproject/cortex:${CORTEX_IMAGE_VERSION:-3.1.8-1}"
+    container_name: cortex
+    hostname: cortex
+    restart: unless-stopped
+    environment:
+      - |
+        JAVA_OPTS=
+          -Xms1000M
+          -Xmx1000M
+          -XX:MaxMetaspaceSize=256m
+          -XX:ReservedCodeCacheSize=256m
+      - es_uri=http://cortex-elasticsearch:9200
+      - job_directory=/tmp/cortex-jobs
+      - "docker_job_directory=${CORTEX_DOCKER_JOB_DIR:-./docker/prod1-cortex/cortex/cortex-jobs}"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./docker/prod1-cortex/cortex/cortex-jobs:/tmp/cortex-jobs
+      - ./docker/prod1-cortex/cortex/config:/etc/cortex:ro
+      - ./docker/prod1-cortex/cortex/logs:/var/log/cortex
+      - ./docker/prod1-cortex/cortex/neurons:/opt/cortexneurons
+      - ./pki/ca/ca.crt:/etc/ssl/certs/soar-ca.crt:ro
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '2.000'
+    memswap_limit: 2G
+    networks:
+      - cortex-network
+      - soar-shared
+    ports:
+      - '0.0.0.0:9001:9001'
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s -f http://localhost:9001/api/status || exit 1"]
+      start_period: 120s
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    depends_on:
+      cortex-elasticsearch:
+        condition: service_healthy
+    labels:
+      com.strangebee.stack: "cortex-stack"
+      com.strangebee.service: "cortex"
+
+  cortex-nginx:
+    image: "nginx:${NGINX_IMAGE_VERSION:-1.27.5}"
+    container_name: cortex-nginx
+    hostname: cortex-nginx
+    restart: unless-stopped
+    environment:
+      SERVER_NAME: "${VM_HOSTNAME:-intelbroelk}"
+      NGINX_SSL_TRUSTED_CERTIFICATE: "${NGINX_SSL_TRUSTED_CERT:-/etc/nginx/certs/ca.pem}"
+    volumes:
+      - ./docker/prod1-cortex/nginx/templates:/etc/nginx/templates
+      - ./docker/prod1-cortex/nginx/certs:/etc/nginx/certs
+    ports:
+      - '8443:443'
+    networks:
+      - cortex-network
+      - soar-shared
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '1.000'
+    depends_on:
+      - cortex
+    labels:
+      com.strangebee.stack: "cortex-stack"
+      com.strangebee.service: "nginx"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # THEHIVE — Security Incident Response
+  # Ports: 9000 (internal), 5443 (HTTPS via nginx)
+  # Certs: docker/prod1-thehive/nginx/certs/ → /etc/nginx/certs/
+  # Depends on: cortex (healthy)
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  cassandra:
+    image: "cassandra:${CASSANDRA_IMAGE_VERSION:-4.1.8}"
+    container_name: cassandra
+    hostname: cassandra
+    restart: unless-stopped
+    user: "${SOAR_UID:-1000}:${SOAR_GID:-1000}"
+    environment:
+      - CASSANDRA_CLUSTER_NAME=TheHive
+      - CASSANDRA_AUTHENTICATOR=PasswordAuthenticator
+      - CASSANDRA_NUM_TOKENS=4
+      - HEAP_NEWSIZE=256M
+      - MAX_HEAP_SIZE=1500M
+    volumes:
+      - ./docker/prod1-thehive/cassandra/data:/var/lib/cassandra
+      - ./docker/prod1-thehive/cassandra/logs:/var/log/cassandra
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '3.000'
+    memswap_limit: 2G
+    networks:
+      - thehive-network
+    healthcheck:
+      test: ["CMD-SHELL", "cqlsh -u cassandra -p cassandra -e 'describe keyspaces' || exit 1"]
+      start_period: 120s
+      interval: 2s
+      timeout: 1s
+      retries: 3
+    labels:
+      com.strangebee.stack: "thehive-stack"
+      com.strangebee.service: "cassandra"
+
+  thehive-elasticsearch:
+    image: "elasticsearch:${ES_IMAGE_VERSION:-7.17.28}"
+    container_name: elasticsearch
+    hostname: elasticsearch
+    restart: unless-stopped
+    user: "${SOAR_UID:-1000}:0"
+    environment:
+      - http.host=0.0.0.0
+      - discovery.type=single-node
+      - cluster.name=hive
+      - thread_pool.search.queue_size=100000
+      - thread_pool.write.queue_size=100000
+      - bootstrap.memory_lock=true
+      - xpack.security.enabled=true
+      - "ELASTIC_PASSWORD=${THEHIVE_ES_PASSWORD:?Set THEHIVE_ES_PASSWORD in .env}"
+      - ES_JAVA_OPTS=-Xms1500m -Xmx1500m
+    volumes:
+      - ./docker/prod1-thehive/elasticsearch/data:/usr/share/elasticsearch/data
+      - ./docker/prod1-thehive/elasticsearch/logs:/usr/share/elasticsearch/logs
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '3.000'
+    memswap_limit: 2G
+    networks:
+      - thehive-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f -s -u 'elastic:${THEHIVE_ES_PASSWORD}' http://elasticsearch:9200/_cat/health || exit 1"]
+      start_period: 40s
+      interval: 2s
+      timeout: 1s
+      retries: 5
+    labels:
+      com.strangebee.stack: "thehive-stack"
+      com.strangebee.service: "elasticsearch"
+
+  thehive:
+    image: "strangebee/thehive:${THEHIVE_IMAGE_VERSION:-5.5.2-1}"
+    container_name: thehive
+    hostname: thehive
+    restart: unless-stopped
+    command: '--no-config --no-config-secret'
+    user: "${SOAR_UID:-1000}:${SOAR_GID:-1000}"
+    environment:
+      - |
+        JAVA_OPTS=
+          -Xms3000M
+          -Xmx3000M
+          -XX:MaxMetaspaceSize=400m
+          -XX:ReservedCodeCacheSize=400m
+          -Djavax.net.ssl.trustStore=/opt/thp/thehive/tls/truststore.jks
+          -Djavax.net.ssl.trustStorePassword=changeit
+    volumes:
+      - ./docker/prod1-thehive/thehive/data/tls:/opt/thp/thehive/tls
+      - ./docker/prod1-thehive/thehive/config:/etc/thehive:ro
+      - ./docker/prod1-thehive/thehive/data/files:/opt/thp/thehive/files
+      - ./docker/prod1-thehive/thehive/logs:/var/log/thehive
+      - ./pki/ca/ca.crt:/etc/ssl/certs/soar-ca.crt:ro
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+          cpus: '4.000'
+    memswap_limit: 4G
+    networks:
+      - thehive-network
+      - soar-shared
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s -f thehive:9000/thehive/api/status || exit 1"]
+      start_period: 40s
+      interval: 10s
+      timeout: 1s
+      retries: 5
+    depends_on:
+      thehive-elasticsearch:
+        condition: service_healthy
+      cassandra:
+        condition: service_healthy
+      cortex:
+        condition: service_healthy
+    labels:
+      com.strangebee.stack: "thehive-stack"
+      com.strangebee.service: "thehive"
+
+  thehive-nginx:
+    image: "nginx:${NGINX_IMAGE_VERSION:-1.27.5}"
+    container_name: nginx
+    hostname: nginx
+    restart: unless-stopped
+    environment:
+      SERVER_NAME: "${VM_HOSTNAME:-intelbroelk}"
+      NGINX_SSL_TRUSTED_CERTIFICATE: "${NGINX_SSL_TRUSTED_CERT:-/etc/nginx/certs/ca.pem}"
+    volumes:
+      - ./docker/prod1-thehive/nginx/templates:/etc/nginx/templates
+      - ./docker/prod1-thehive/nginx/certs:/etc/nginx/certs
+    ports:
+      - '5443:443'
+    networks:
+      - thehive-network
+      - soar-shared
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '1.000'
+    depends_on:
+      thehive:
+        condition: service_healthy
+    labels:
+      com.strangebee.stack: "thehive-stack"
+      com.strangebee.service: "nginx"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # SHUFFLE — SOAR Automation Workflows
+  # Ports: 3001 (HTTP), 3443 (HTTPS frontend), 5001 (backend API)
+  # Depends on: thehive (healthy)
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  shuffle-opensearch:
+    image: opensearchproject/opensearch:3.2.0
+    hostname: shuffle-opensearch
+    container_name: shuffle-opensearch
+    env_file: ./Shuffle/.env
+    environment:
+      - "OPENSEARCH_JAVA_OPTS=-Xms3072m -Xmx3072m"
+      - bootstrap.memory_lock=true
+      - DISABLE_PERFORMANCE_ANALYZER_AGENT_CLI=true
+      - cluster.initial_master_nodes=shuffle-opensearch
+      - cluster.routing.allocation.disk.threshold_enabled=false
+      - cluster.name=shuffle-cluster
+      - node.name=shuffle-opensearch
+      - node.store.allow_mmap=false
+      - discovery.seed_hosts=shuffle-opensearch
+      - "OPENSEARCH_INITIAL_ADMIN_PASSWORD=${SHUFFLE_OPENSEARCH_PASSWORD:?Set SHUFFLE_OPENSEARCH_PASSWORD in Shuffle/.env}"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - shuffle-database:/usr/share/opensearch/data:z
+    ports:
+      - "9200:9200"
+    networks:
+      - shuffle
+    restart: unless-stopped
+
+  shuffle-backend:
+    image: ghcr.io/shuffle/shuffle-backend:latest
+    container_name: shuffle-backend
+    hostname: shuffle-backend
+    ports:
+      - "${SHUFFLE_BACKEND_PORT:-5001}:5001"
+    networks:
+      - shuffle
+      - soar-shared
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${SHUFFLE_APP_HOTLOAD_LOCATION:-./Shuffle/shuffle-apps}:/shuffle-apps:z
+      - ${SHUFFLE_FILE_LOCATION:-./Shuffle/shuffle-files}:/shuffle-files:z
+    env_file: ./Shuffle/.env
+    environment:
+      - SHUFFLE_APP_HOTLOAD_FOLDER=/shuffle-apps
+      - SHUFFLE_FILE_LOCATION=/shuffle-files
+      - "AI_API_URL=${AI_API_URL}"
+      - "AI_MODEL=${AI_MODEL}"
+      - "AI_API_KEY=${AI_API_KEY}"
+    restart: unless-stopped
+    depends_on:
+      thehive:
+        condition: service_healthy
+      shuffle-opensearch:
+        condition: service_started
+
+  shuffle-frontend:
+    image: ghcr.io/shuffle/shuffle-frontend:latest
+    container_name: shuffle-frontend
+    hostname: shuffle-frontend
+    ports:
+      - "${SHUFFLE_FRONTEND_PORT:-3001}:80"
+      - "${SHUFFLE_FRONTEND_PORT_HTTPS:-3443}:443"
+    networks:
+      - shuffle
+    environment:
+      - "BACKEND_HOSTNAME=${SHUFFLE_BACKEND_HOSTNAME:-shuffle-backend}"
+    restart: unless-stopped
+    depends_on:
+      - shuffle-backend
+
+  shuffle-orborus:
+    image: ghcr.io/shuffle/shuffle-orborus:latest
+    container_name: shuffle-orborus
+    hostname: shuffle-orborus
+    networks:
+      - shuffle
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    env_file: ./Shuffle/.env
+    environment:
+      - SHUFFLE_APP_SDK_TIMEOUT=300
+      - ENVIRONMENT_NAME=Shuffle
+      - ORG_ID=Shuffle
+      - "BASE_URL=http://${SHUFFLE_OUTER_HOSTNAME:-shuffle-backend}:5001"
+      - DOCKER_API_VERSION=1.40
+      - SHUFFLE_STATS_DISABLED=true
+      - SHUFFLE_LOGS_DISABLED=true
+      - SHUFFLE_SWARM_CONFIG=run
+      - CLEANUP=false
+      - SHUFFLE_WORKER_IMAGE=ghcr.io/shuffle/shuffle-worker:latest
+    restart: unless-stopped
+    security_opt:
+      - seccomp:unconfined
